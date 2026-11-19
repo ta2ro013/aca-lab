@@ -65,16 +65,42 @@ AWSとの対応はこうなります。
 
 ## 事前準備
 
-必要なのはAzureサブスクリプション、GitHubアカウント、Azure CLI、Docker、Node.js 20以上、Python 3.12の6つです。
+必要なのはAzureサブスクリプション、GitHubアカウント、Azure CLI、Docker、Node.js 20以上、[uv](https://docs.astral.sh/uv/)、[Task](https://taskfile.dev/) の7つです。Python 3.12 は uv が用意するので、別に入れなくて構いません。
 
-リポジトリは1つで、`api/` と `web/` を並べます。
+リポジトリは1つで、`api/` と `web/` を並べます。Pythonの依存と設定はルートの `pyproject.toml` にまとめます。
 
 ```text
 aca-lab/
-  api/        # FastAPI + Dockerfile
-  web/        # React (Vite)
-  .github/workflows/deploy.yml
+  api/
+    main.py           # FastAPI
+    Dockerfile
+  web/                # React (Vite)。Lab 2で作る
+  .github/workflows/deploy.yml   # Lab 3で書く
+  pyproject.toml      # Pythonの依存と、Ruff・Pyrightの設定
+  uv.lock             # 依存のバージョンを固定したもの（uvが作る）
+  .python-version     # 使うPythonのバージョン（3.12）
+  .dockerignore       # コンテナのビルドに送らないファイル
+  Taskfile.yml        # よく使うコマンドのまとめ
 ```
+
+Pythonのプロジェクトを作り、依存を入れます。
+
+```bash
+uv init --python 3.12               # pyproject.toml と .python-version ができる
+uv add fastapi "uvicorn[standard]"  # アプリの依存
+uv add --dev ruff pyright           # 開発中だけ使う道具（コンテナには入らない）
+```
+
+`uv add` すると `uv.lock` が更新され、手元とコンテナで同じバージョンが入ります。Ruff（Lint・フォーマット）と Pyright（型チェック）の設定は `pyproject.toml` の `[tool.ruff]` と `[tool.pyright]` に書いてあります。
+
+よく使うコマンドは `Taskfile.yml` にまとめてあり、`task --list` で一覧が出ます。
+
+| コマンド | やること |
+| --- | --- |
+| `task run:api` | FastAPIを手元で起動する（保存すると自動で再起動） |
+| `task build:api` | APIのコンテナイメージ `api:local` をビルドする |
+| `task lint` | Lint・フォーマット・型をチェックする（ファイルは変えない） |
+| `task fmt` | 自動で直せる指摘を直し、フォーマットを整える |
 
 共通の変数とリソースグループを作ります。以降のLabはこの変数を使うので、ターミナルを開き直したら再度実行してください（`ACR` と `SA` は初回に決めた値を固定で入れ直す）。
 
@@ -83,6 +109,8 @@ az login
 az extension add --name containerapp --upgrade
 az provider register --namespace Microsoft.App
 az provider register --namespace Microsoft.OperationalInsights
+az provider register --namespace Microsoft.ContainerRegistry
+az provider register --namespace Microsoft.Storage
 
 RG=rg-aca-lab
 LOC=japaneast
@@ -96,13 +124,21 @@ az group create -n $RG -l $LOC
 
 リソースをすべて1つのリソースグループに入れるのがポイントです。最後に `az group delete` 一発で全部消せます。
 
+`az provider register` は、サブスクリプションでそのサービスを使えるようにする手続きで、最初の1回だけ必要です。登録には数分かかります。済む前にリソースを作ると `MissingSubscriptionRegistration` エラーになるので、次のコマンドで4つとも `Registered` になったのを確かめてから進めます。
+
+```bash
+for ns in Microsoft.App Microsoft.OperationalInsights Microsoft.ContainerRegistry Microsoft.Storage; do
+  echo "$ns $(az provider show -n $ns --query registrationState -o tsv)"
+done
+```
+
 ## Lab 1：FastAPIをコンテナ化してContainer Appsで動かす
 
 ゴールは、インターネットから `https://<アプリ>.<リージョン>.azurecontainerapps.io/api/whoami` を叩いてレプリカ名が返ることです。
 
 ### 1. アプリを書く
 
-エンドポイントは3つ。`whoami` はどのレプリカが応答したかの確認用、`work` はLab 4の負荷用、`counter` はLab 5で直す「状態を持ってしまっているAPI」です。
+エンドポイントは4つ。`healthz` は死活確認用、`whoami` はどのレプリカが応答したかの確認用、`work` はLab 4の負荷用、`counter` はLab 5で直す「状態を持ってしまっているAPI」です。
 
 `api/main.py`
 
@@ -110,7 +146,9 @@ az group create -n $RG -l $LOC
 import asyncio
 import os
 import socket
+import time
 from collections import defaultdict
+from typing import Annotated
 
 from fastapi import FastAPI, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -129,6 +167,17 @@ REPLICA = os.getenv("CONTAINER_APP_REPLICA_NAME", socket.gethostname())
 # プロセス内メモリに状態を持つ（Lab 5でこれが問題になる）
 counts: dict[str, int] = defaultdict(int)
 
+# アプリケーションの起動時刻を記録
+STARTED_AT = time.monotonic()
+
+
+@app.get("/healthz")
+async def healthz():
+    return {
+        "status": "ok",
+        "uptime": time.monotonic() - STARTED_AT,
+    }
+
 
 @app.get("/api/whoami")
 async def whoami():
@@ -142,55 +191,118 @@ async def work():
 
 
 @app.post("/api/counter")
-async def counter(x_session_id: str = Header()):
+async def counter(x_session_id: Annotated[str, Header()]):
     counts[x_session_id] += 1
     return {"count": counts[x_session_id], "replica": REPLICA}
 ```
 
-`api/requirements.txt`
+`uptime` は `time.monotonic()` の差で測ります。`time.monotonic()` の値そのものはOSが起動してからの秒数なので、起動時刻を覚えておいて引き算します。
 
-```text
-fastapi
-uvicorn[standard]
+ヘッダーの受け取りは `Annotated[str, Header()]` と書きます。FastAPIが今すすめている書き方で、古い `x_session_id: str = Header()` だと Ruff が FAST002 で指摘します。
+
+まずはコンテナを使わずに起動して確認します。
+
+```bash
+task run:api                      # = cd api && uv run uvicorn main:app --reload --port 8000
+curl localhost:8000/api/whoami    # 別のターミナルで
+task lint                         # Lint・型チェックも通しておく
 ```
+
+### 2. コンテナにする
 
 `api/Dockerfile`
 
 ```dockerfile
 FROM python:3.12-slim
+COPY --from=ghcr.io/astral-sh/uv:0.11.29 /uv /uvx /bin/
+
+# アプリ専用の一般ユーザーを作る（UIDは数字で指定できるよう固定）
+RUN groupadd --system --gid 10001 app \
+ && useradd --system --uid 10001 --gid app --no-create-home app
+
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY main.py .
+ENV UV_COMPILE_BYTECODE=1
+# イメージに入っているPythonを使う。
+ENV UV_PYTHON_DOWNLOADS=never
+
+# 依存だけ先に入れる
+# （main.py を変えても、このレイヤーはキャッシュが効く）
+COPY pyproject.toml uv.lock ./
+RUN uv sync --locked --no-dev --no-install-project --no-cache
+
+COPY api/main.py .
+ENV PATH="/app/.venv/bin:$PATH"
+
+# 実行時は一般ユーザーで動かす。
+# ファイルの持ち主は root のままなので、アプリからはコードも依存も書き換えられない
+USER 10001:10001
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
-ローカルで確認します。
+ポイントは3つです。
 
-```bash
-docker build -t api:local ./api
-docker run --rm -p 8000:8000 api:local
-curl localhost:8000/api/whoami
+- **依存は `uv.lock` から入れる**: `uv sync --locked` は `uv.lock` と同じバージョンを入れ、`pyproject.toml` と食い違っていればエラーにします。`--no-dev` で Ruff や Pyright は入りません。
+- **一般ユーザーで動かす**: ベースイメージのままだと root で動きます。アプリに脆弱性があったときの被害を小さくするため、`USER` で一般ユーザーに切り替えます。`pip install` や `uv sync` には root が要るので、切り替えは最後です。
+- **`UV_PYTHON_DOWNLOADS=never`**: uv が別のPythonをダウンロードすると `/root` の下に置かれ、一般ユーザーからは読めなくなります。イメージに入っているPythonを使わせるための設定です。
+
+Dockerfile は `api/` にありますが、`pyproject.toml` と `uv.lock` はルートにあるので、ビルドはルートから行います。ルートには `.dockerignore` を置いて、イメージに要るファイルだけをビルドに送ります。
+
+`.dockerignore`
+
+```text
+# いったん全部をビルドに送らないようにして、イメージに必要なものだけ戻す。
+# .venv や web/node_modules、.env などをうっかり送らずに済む
+*
+
+# 依存（uv sync で使う）
+!pyproject.toml
+!uv.lock
+
+# API のコード（Dockerfile もここにある）
+!api/
+api/__pycache__/
 ```
 
-### 2. ACRを作ってイメージをビルドする
+これがないと、`.venv`（100MB前後）などもビルドのたびに送られます。`az acr build` では毎回Azureにアップロードされるので、遅くなります。
 
-`az acr build` はビルドをACR側で実行するので、手元のCPUアーキテクチャ（Apple Siliconなど）を気にせず済みます。
+ローカルでビルドして確認します。
+
+```bash
+task build:api                     # = docker build -f api/Dockerfile -t api:local .
+docker run --rm -p 8000:8000 api:local
+curl localhost:8000/api/whoami     # 別のターミナルで
+docker run --rm api:local id       # uid=10001(app) なら一般ユーザーで動いている
+```
+
+`docker build` の `-f` は使う Dockerfile、最後の `.` は `COPY` できるファイルの範囲（ビルドコンテキスト）です。`-f` を省くと、Docker は `.` の直下で `Dockerfile` を探して失敗します。
+
+### 3. ACRを作ってイメージをビルドする
+
+`az acr build` はビルドをACR側で実行するので、手元のCPUアーキテクチャ（Apple Siliconなど）を気にせず済みます。`-f` と最後の `.` の意味はローカルの `docker build` と同じです。
 
 ```bash
 az acr create -n $ACR -g $RG --sku Basic
-az acr build -r $ACR -t api:v1 ./api
+az acr build -r $ACR -t api:v1 -f api/Dockerfile .
 ```
+
+`-r $ACR` で送り先を指定しているので、`-t` はACRの中での名前（`api:v1`）だけで足ります。ビルドが終わると、そのままACRに保存されます。
 
 無料クレジットのサブスクリプションでは `az acr build` が拒否されることがあります。その場合はローカルでビルドしてpushします。
 
 ```bash
 az acr login -n $ACR
-docker build --platform linux/amd64 -t $ACR.azurecr.io/api:v1 ./api
+task build:api -- --platform linux/amd64 -t $ACR.azurecr.io/api:v1
 docker push $ACR.azurecr.io/api:v1
 ```
 
-### 3. Container Appsにデプロイする
+ローカルでビルドするときは、オプションが2つ増えます。
+
+- **`--platform linux/amd64`**: Container Apps が動かすのは `linux/amd64` のイメージです。Apple Silicon の Mac では何もしないと `arm64` のイメージになり、Azure で起動できません。Windows（WSL）や Intel の Mac はもともと amd64 なので、付けても結果は同じです。
+- **`-t $ACR.azurecr.io/api:v1`**: `docker push` はイメージ名の先頭のホスト名を送り先にします。`api:v1` のままだと Docker Hub に送ろうとするので、ACRのアドレスから始まる名前を付けます。
+
+`task build:api -- ...` の `--` 以降は `docker build` にそのまま渡ります。最後の `.` はタスクの中で付けているので、自分では付けません。`$ACR` が空だと名前が不正になって失敗するので、先に `echo $ACR` で確かめてください。
+
+### 4. Container Appsにデプロイする
 
 環境（Environment）は複数アプリが共有するネットワークとログの境界で、ECSのクラスターに近いものです。
 
@@ -210,9 +322,39 @@ curl https://$FQDN/api/whoami
 
 `--registry-identity system` で、アプリのマネージドIDにACRのPull権限が付きます。パスワードをどこにも置かないのがAzure流です。
 
+### 5. 自分のIPからだけアクセスできるようにする
+
+このままだと、URLを知っていれば誰でもAPIを叩けます。Ingress のIP制限で、作業している回線からだけ届くようにします。`az containerapp create` にはIP制限のオプションがないので、作成のあとに設定します。
+
+```bash
+MY_IP=$(curl -4 -s https://ifconfig.me)   # このマシンのグローバルIP（IPv4）
+echo $MY_IP
+
+az containerapp ingress access-restriction set -n api -g $RG \
+  --rule-name allow-my-ip \
+  --ip-address $MY_IP/32 \
+  --action Allow \
+  --description "作業マシン"
+
+az containerapp ingress access-restriction list -n api -g $RG -o table
+```
+
+- **`--action Allow`**: 許可のルールが1つでもあると、それ以外のIPからは全部拒否され、403が返ります。許可と拒否のルールは混ぜられません。
+- **`/32`**: そのIPアドレス1つだけ、という意味です。
+- **許可されるのは同じ回線の全員です**: 外からは家のルーターのIP1つに見えるので、同じWi-Fiのスマホなども通ります。
+- **IPが変わると急に403になります**: ルーターの再起動などでグローバルIPが変わったら、同じルール名でもう一度 `set` すると上書きされます。
+
+作成から制限までの数十秒は誰でもアクセスできますが、このAPIは秘密を持っていないので問題ありません。後のLabへの影響はほぼありません。Lab 2のReactはこのマシンのブラウザからAPIを呼び、Lab 3のデプロイはIngressを通らず、Lab 4の負荷も手元から打つからです。外す場合は次のコマンドです。
+
+```bash
+az containerapp ingress access-restriction remove -n api -g $RG --rule-name allow-my-ip
+```
+
 ### 確認ポイント
 
 - [ ] `whoami` がレプリカ名を返す
+- [ ] `curl https://$FQDN/healthz` で `uptime` が起動からの秒数になっている
+- [ ] スマホのWi-Fiを切ってモバイル回線から `https://$FQDN/api/whoami` を開くと、403になる
 - [ ] `az containerapp replica list -n api -g $RG -o table` でレプリカが見える
 - [ ] `az containerapp logs show -n api -g $RG --follow` でuvicornのログが流れる
 - [ ] 数分放置するとレプリカが0になり、次のリクエストが少し遅い（コールドスタート）ことを体感する
@@ -388,7 +530,7 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       - name: Build image in ACR
-        run: az acr build -r $ACR -t api:${{ github.sha }} ./api
+        run: az acr build -r $ACR -t api:${{ github.sha }} -f api/Dockerfile .
       - name: Deploy new revision
         run: |
           az extension add --name containerapp --upgrade
@@ -425,7 +567,7 @@ jobs:
 - [ ] `whoami` のレスポンスに `"version": "2"` を足してpushし、数分後にcurlで反映を確認する
 - [ ] Reactの見出しを変えてpushし、ブラウザで反映を確認する
 - [ ] フェデレーション資格情報の `subject` をわざと別ブランチ名にして、ログインが失敗するのを見る（終わったら戻す）
-- [ ] 余裕があれば `paths:` フィルターで、`api/` の変更時だけapiジョブが動くようにする
+- [ ] 余裕があれば `paths:` フィルターで、APIに関係するファイル（`api/`、`pyproject.toml`、`uv.lock`）の変更時だけapiジョブが動くようにする
 
 ## Lab 4：負荷をかけてレプリカが増えるのを観察する
 
@@ -477,7 +619,7 @@ hey -z 120s -c 60 https://$FQDN/api/work
 
 - [ ] しきい値を `50` に変えて同じ負荷をかけ、レプリカ数が2にとどまるか確認する
 - [ ] `--max-replicas 1` にして同じ負荷をかけ、レイテンシがどう変わるか見る（asyncなので意外と耐える。なぜか考える）
-- [ ] `work` の `asyncio.sleep` を `time.sleep` に変えてデプロイし、1レプリカで負荷をかける（イベントループをブロックすると何が起きるか）
+- [ ] `work` の `asyncio.sleep` を `time.sleep` に変えてデプロイし、1レプリカで負荷をかける（イベントループをブロックすると何が起きるか）。変えた時点で `task lint` が ASYNC251 で指摘するのも見ておく
 - [ ] `--min-replicas 0` に戻し、ゼロからの立ち上がりで最初のリクエストが何秒かかるか測る
 
 終わったら課金を止めるために `--min-replicas 0` に戻しておきます。
@@ -539,7 +681,7 @@ az containerapp create -n redis -g $RG --environment $ENV \
 az containerapp update -n api -g $RG --set-env-vars REDIS_URL=redis://redis:6379/0
 ```
 
-`api/requirements.txt` に `redis` を足し、`api/main.py` のカウンター部分を置き換えます。`counts` 辞書は削除します。
+`uv add redis` で依存に足し、`api/main.py` のカウンター部分を置き換えます。`counts` 辞書と `defaultdict` の import は削除します（消し忘れても `task lint` が教えてくれます）。
 
 ```python
 import redis.asyncio as redis
@@ -548,10 +690,10 @@ r = redis.from_url(os.environ["REDIS_URL"], decode_responses=True)
 
 
 @app.post("/api/counter")
-async def counter(x_session_id: str = Header()):
+async def counter(x_session_id: Annotated[str, Header()]):
     key = f"count:{x_session_id}"
-    count = await r.incr(key)      # アトミックなので同時アクセスでもずれない
-    await r.expire(key, 3600)      # セッションの有効期限
+    count = await r.incr(key)  # アトミックなので同時アクセスでもずれない
+    await r.expire(key, 3600)  # セッションの有効期限
     return {"count": count, "replica": REPLICA}
 ```
 
@@ -592,7 +734,7 @@ az ad app delete --id $APP_ID
 3. フロントをStatic Web Appsに載せ替え、Storage版とデプロイ体験を比べる
 4. Storageの前にFront Doorを置き、独自ドメインとキャッシュを付ける（CloudFront相当）
 5. リビジョンを複数モードにして、新旧にトラフィックを90:10で流す（カナリアリリース）
-6. `hey` をAzure Load Testingに置き換え、CIから負荷テストを回す
+6. `hey` をAzure Load Testingに置き換え、CIから負荷テストを回す（Azure側から打つので、Lab 1のIP制限を外すか、許可するIPを足す）
 7. ログイン状態をJWTで持たせ、「クライアントに持たせるステートレス」を実装する
 
 ## 理解度チェック

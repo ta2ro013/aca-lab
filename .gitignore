@@ -1,0 +1,2 @@
+# Python が実行時に作るキャッシュ（.venv と .ruff_cache は中に自前の .gitignore がある）
+__pycache__/

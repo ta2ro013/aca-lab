@@ -1,0 +1,11 @@
+# いったん全部をビルドに送らないようにして、イメージに必要なものだけ戻す。
+# .venv や web/node_modules、.env などをうっかり送らずに済む
+*
+
+# 依存（uv sync で使う）
+!pyproject.toml
+!uv.lock
+
+# API のコード（Dockerfile もここにある）
+!api/
+api/__pycache__/

@@ -4,4 +4,38 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "fastapi>=0.165.0",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.414",
+    "ruff>=0.17.5",
+]
+
+[tool.ruff]
+line-length = 88
+# api/ の中のファイルを「自分のコード」として import を並べ替える
+src = ["api"]
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle（書き方の基本）
+    "W",     # pycodestyle の警告
+    "F",     # Pyflakes（未使用の import や変数など）
+    "I",     # isort（import の並び順）
+    "B",     # flake8-bugbear（バグになりやすい書き方）
+    "UP",    # pyupgrade（古い書き方を新しい書き方へ）
+    "SIM",   # flake8-simplify（もっと簡単に書ける箇所）
+    "ASYNC", # flake8-async（async 関数の中でのブロッキング処理など）
+    "FAST",  # FastAPI 向けのルール
+]
+
+[tool.pyright]
+include = ["api"]
+pythonVersion = "3.12"
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "standard"

@@ -1,0 +1,28 @@
+version: "3"
+
+tasks:
+  run:api:
+    desc: FastAPIをローカルで起動する（ファイル保存で自動リロード）
+    dir: api
+    cmds:
+      - uv run uvicorn main:app --reload --port 8000 {{.CLI_ARGS}}
+
+  build:api:
+    desc: APIのコンテナイメージをビルドする（api:local）
+    cmds:
+      # Dockerfile は api/ にあるが、pyproject.toml と uv.lock を使うのでルートからビルドする
+      - docker build -f api/Dockerfile -t api:local {{.CLI_ARGS}} .
+
+  lint:
+    desc: Lint・フォーマット・型をチェックする（ファイルは変更しない）
+    cmds:
+      - uv run ruff check
+      - uv run ruff format --check
+      - uv run pyright
+
+  fmt:
+    desc: 自動で直せる指摘を直し、フォーマットを整える
+    cmds:
+      # 手で直す指摘が残っていても、フォーマットまで進める
+      - uv run ruff check --fix --exit-zero
+      - uv run ruff format
