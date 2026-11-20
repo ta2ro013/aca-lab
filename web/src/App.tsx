@@ -25,7 +25,7 @@ export default function App() {
 
   return (
     <main>
-      <h1>ACA Lab</h1>
+      <h1>ACA Lab v2</h1>
       <button onClick={hit}>+1</button>
       <ul>
         {log.map((line, i) => (
