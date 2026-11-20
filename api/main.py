@@ -36,7 +36,7 @@ async def healthz():
 
 @app.get("/api/whoami")
 async def whoami():
-    return {"replica": REPLICA}
+    return {"replica": REPLICA, "version": 2}
 
 
 @app.get("/api/work")

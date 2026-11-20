@@ -1,0 +1,54 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write   # OIDCトークンの発行に必要
+  contents: read
+
+env:
+  RG: rg-aca-lab
+  ACR: acalab28867
+  SA: stacalab32699
+  API_URL: https://api.bluehill-25a69499.japaneast.azurecontainerapps.io
+
+jobs:
+  api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Build image in ACR
+        run: az acr build -r $ACR -t api:${{ github.sha }} -f api/Dockerfile .
+      - name: Deploy new revision
+        run: |
+          az extension add --name containerapp --upgrade
+          az containerapp update -n api -g $RG \
+            --image $ACR.azurecr.io/api:${{ github.sha }}
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Build
+        working-directory: web
+        # --frozen-lockfile は npm ci 相当。bun.lock と package.json が食い違うと失敗する
+        run: bun install --frozen-lockfile && bun run build
+        env:
+          VITE_API_URL: ${{ env.API_URL }}
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Upload to $web
+        run: |
+          az storage blob upload-batch --account-name $SA --auth-mode login \
+            -s web/dist -d '$web' --overwrite

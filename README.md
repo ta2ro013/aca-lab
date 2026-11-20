@@ -65,7 +65,7 @@ AWSとの対応はこうなります。
 
 ## 事前準備
 
-必要なのはAzureサブスクリプション、GitHubアカウント、Azure CLI、Docker、Node.js 20以上、[uv](https://docs.astral.sh/uv/)、[Task](https://taskfile.dev/) の7つです。Python 3.12 は uv が用意するので、別に入れなくて構いません。
+必要なのはAzureサブスクリプション、GitHubアカウント、Azure CLI、Docker、[Bun](https://bun.sh/) 1.2以上、[uv](https://docs.astral.sh/uv/)、[Task](https://taskfile.dev/) の7つです。Python 3.12 は uv が用意するので、別に入れなくて構いません。
 
 リポジトリは1つで、`api/` と `web/` を並べます。Pythonの依存と設定はルートの `pyproject.toml` にまとめます。
 
@@ -368,9 +368,11 @@ AzureにはビルドとCDNまで面倒を見るStatic Web Appsもあり、実務
 ### 1. Reactアプリを作る
 
 ```bash
-npm create vite@latest web -- --template react-ts
-cd web && npm install
+bun create vite web --template react-ts
+cd web && bun install
 ```
+
+`bun install` で `web/bun.lock` ができます。Lab 3のCIはこれを見て同じバージョンを入れるので、コミットしておきます。Node.jsは入れなくて構いません。`package.json` のスクリプト（`vite` など）は、Node.jsがなければBunが代わりに動かします。
 
 `web/src/App.tsx` を置き換えます。セッションIDを `localStorage` に持ち、ボタンを押すたびに `counter` を叩いて、カウントと応答したレプリカ名を並べます。
 
@@ -417,7 +419,7 @@ export default function App() {
 ビルド時にAPIのURLを埋め込みます。
 
 ```bash
-VITE_API_URL=https://$FQDN npm run build   # dist/ ができる
+VITE_API_URL=https://$FQDN bun run build   # dist/ ができる
 cd ..
 ```
 
@@ -541,12 +543,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
+      - uses: oven-sh/setup-bun@v2
       - name: Build
         working-directory: web
-        run: npm ci && npm run build
+        # --frozen-lockfile は npm ci 相当。bun.lock と package.json が食い違うと失敗する
+        run: bun install --frozen-lockfile && bun run build
         env:
           VITE_API_URL: ${{ env.API_URL }}
       - uses: azure/login@v2
