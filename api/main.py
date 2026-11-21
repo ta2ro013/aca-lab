@@ -5,6 +5,7 @@ import time
 from collections import defaultdict
 from typing import Annotated
 
+import redis.asyncio as redis
 from fastapi import FastAPI, Header
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -45,7 +46,12 @@ async def work():
     return {"replica": REPLICA}
 
 
+r = redis.from_url(os.environ["REDIS_URL"], decode_responses=True)
+
+
 @app.post("/api/counter")
 async def counter(x_session_id: Annotated[str, Header()]):
-    counts[x_session_id] += 1
-    return {"count": counts[x_session_id], "replica": REPLICA}
+    key = f"count:{x_session_id}"
+    count = await r.incr(key)  # アトミックなので同時アクセスでもずれない
+    await r.expire(key, 3600)  # セッションの有効期限
+    return {"count": count, "replica": REPLICA}
